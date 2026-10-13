@@ -3,9 +3,9 @@
 Separate tweeter and woofer streams for the internal speakers of the MacBook Pro 11,3 (A1398, late 2013) on
 Linux, and its headset microphone. Russian version: [README.ru.md](README.ru.md).
 
-**Status (2026-10-13):** the kernel patch is booted and works: the two pairs play two PCM devices
-independently. The PipeWire crossover runs and both pairs play through it; the owner rates the sound as
-excellent with `BASS_GAIN=2 PREAMP=0 LOUD=6` and the limiter. Start after a reboot is **not tested yet**.
+**Status (2026-10-13):** both parts work on a MacBookPro11,3 with Linux 6.18.55. Speakers: the two pairs play
+two PCM devices independently and the PipeWire crossover runs on top; the owner rates the sound as excellent
+with `BASS_GAIN=2 PREAMP=0 LOUD=6` and the limiter. Headset microphone: works in the system and in Discord.
 
 ## The problem
 
@@ -40,15 +40,26 @@ With the split on and no crossover in userspace, desktop sound comes from the tw
 
 ## Use
 
-1. Apply the patch to a 6.18 kernel tree (`patch -p1 < patches/0018-cs4208-split-speakers.patch`) and build.
-   The number 0018 is its place in the `linux-lts-mbp` patch series of the
-   [reclocked fork](https://github.com/IgorChicherin/reclocked).
-2. `./install-0018.sh` — for that setup only (Arch, ZFS root, `linux-lts-mbp` built with `makepkg`): takes a ZFS
-   snapshot, writes `/etc/modprobe.d/cs4208-split.conf`, installs the packages, checks DKMS and that the
-   module has the parameter. Set `PKGDIR` if the packages are elsewhere. `./install-0018.sh undo` removes the
-   option.
-3. Reboot, then `tools/speaker-split-test.sh` (no sudo): high tone on device 0, low tone on device 2, then
-   both. Expected: tweeters, woofers, both.
+1. Apply both patches to a 6.18 kernel tree with the one script of this repo, then build and install the
+   kernel your usual way:
+
+   ```
+   ./apply-patches.sh --check /path/to/linux    # what would happen, changes nothing
+   ./apply-patches.sh /path/to/linux
+   ```
+
+   It applies `patches/*.patch` in order, skips what is already in the tree, and changes nothing unless the
+   whole series goes in. `--reverse` takes the patches out again. The numbers 0018 and 0019 are the patches'
+   places in the `linux-lts-mbp` series of the [reclocked fork](https://github.com/IgorChicherin/reclocked),
+   whose build applies them by itself.
+2. Turn the speaker split on (the headset part needs no option) and reboot:
+
+   ```
+   echo 'options snd_hda_codec_cs420x split_speakers=1' | sudo tee /etc/modprobe.d/cs4208-split.conf
+   ```
+
+3. `tools/speaker-split-test.sh` (no sudo): high tone on device 0, low tone on device 2, then both. Expected:
+   tweeters, woofers, both. Then set up the crossover below.
 
 ## PipeWire crossover
 
@@ -104,8 +115,7 @@ crossover and the woofers nothing below `SUB_HP`. Rattle or harsh distortion mea
 
 **Headphones:** while the jack port is active the service makes the plain output the default (full range to
 the headphone DAC; PipeWire mutes both speaker pairs) and switches back on unplug. It only touches the default
-when it is one of these two outputs. Seen working on plug-in (2026-10-13); the switch back on unplug is not
-confirmed yet.
+when it is one of these two outputs. Seen working in both directions (2026-10-13).
 
 **Sync:** both PCMs share one clock name, so PipeWire runs them in one graph without resampling. Measured with
 the internal microphone (chirp on the tweeters, then on the woofers, three cold starts): the woofers arrive
@@ -114,17 +124,16 @@ the microphone.
 
 ## Headset microphone
 
-**Status (2026-10-13):** the first version was booted: the headset is detected at plug-in (`Mic Jack` on,
-GPIO5 high, GPIO4 low), PipeWire switches to the "Microphone" port and headphone playback works. Two faults
-showed up after a power-down of the codec (see below) and are fixed in the current patch; that second version
-builds but has **not been booted yet**.
+**Status (2026-10-13):** works. The owner confirms the headset microphone in the system and in Discord on the
+current patch. Measured on the way: the detection at plug-in, the two FET lines, the level on the microphone
+pin, and that the audio chip sleeps again once the headset is unplugged.
 
-A headset microphone in the combo jack never works on this model in Linux: `Mic Jack` stays off, and forcing
-the capture path to the microphone pin (`0x18`) gives only noise.
+A headset microphone in the combo jack never works on this model in stock Linux: `Mic Jack` stays off, and
+forcing the capture path to the microphone pin (`0x18`) gives only noise. There were two separate causes.
 
-**Cause.** The CS4208 has a headset block that the driver does not use. Two FETs, controlled by GPIO5 and
-GPIO4, ground the two possible microphone contacts while their GPIO is low. The driver leaves both undriven,
-so the microphone is always shorted.
+**Cause 1: the microphone contact is grounded.** The CS4208 has a headset block that the driver does not use.
+Two FETs, controlled by GPIO5 and GPIO4, ground the two possible microphone contacts while their GPIO is low.
+The driver leaves both undriven, so the microphone is always shorted.
 
 | State | Level on pin `0x18` |
 |---|---|
@@ -134,45 +143,57 @@ so the microphone is always shorted.
 | then GPIO5 low, GPIO4 high | -67 dBFS |
 
 How macOS drives the block was read from AppleHDA 10.13.6 (class `AppleHDAMikeyInternalCS4208` and layout 94,
-which belongs to subsystem `106b:5e00`).
+which belongs to subsystem `106b:5e00`), then each step was verified with `hda-verb`.
 
-**The patch.** `patches/0019-cs4208-mbp11-headset-mic.patch` (on top of 0018): when something is plugged into
-the jack, the driver runs the codec's type detection, sets the two GPIOs by the answer and reports the result
-as the presence of pin `0x18`. `Mic Jack` and the automatic microphone switching then work as for any jack.
+**Cause 2: the input amplifier of the headset's ADC is muted.** ADC `0x07` has three inputs but one amplifier.
+`cs4208_probe()` does not set `single_adc_amp` (the CS4206/4207 probe does), so the kernel keeps three cached
+amplifier values, `Capture` drives one and the other two stay at their initial mute. Every cache sync writes all
+three and the chip keeps the last one, a mute: recordings are digital silence although `Capture` shows "on".
+This is a driver bug for every CS4208 machine, not only this model; nobody noticed because the path was never
+used.
+
+**The patch.** `patches/0019-cs4208-mbp11-headset-mic.patch` (on top of 0018):
+
+- When something is plugged into the jack, the driver runs the codec's type detection, sets the two GPIOs by
+  the answer and reports the result as the presence of pin `0x18`. `Mic Jack` and the automatic microphone
+  switching then work as for any jack, and PipeWire selects the "Microphone" port by itself.
+- The codec's headset block loses its state when the codec powers down (measured: -68 dBFS afterwards, -42 dBFS
+  after a new detection). So the driver keeps the codec powered while a headset with a microphone is plugged
+  in, as macOS has to do for the headset buttons. Plain headphones do not hold it up.
+- `single_adc_amp` is set for the CS4208.
 
 ```
-options snd_hda_codec_cs420x headset_mic=0     # turns it off; the default is on
+options snd_hda_codec_cs420x headset_mic=0     # turns the headset part off; the default is on
 ```
 
-- Only for subsystem `106b:5e00` (MacBookPro11,2/11,3): the values are those of Apple's layout for it.
+Limits:
+
+- The headset part is only for subsystem `106b:5e00` (MacBookPro11,2/11,3): the values are those of Apple's
+  layout for it.
 - Verified with a CTIA headset (detector type 0). The other pinout (type 1) follows AppleHDA and is untested.
 - The headset buttons are not handled.
+- The audio chip does not sleep while a headset with a microphone is plugged in. The extra power draw is not
+  measured.
 
-Two things do not survive a power-down of the codec (10 s of silence), both measured on the first version:
+**Use.** Nothing beyond the patched kernel (`./apply-patches.sh`, see "Use" above). Plug the headset in and run `tools/headset-mic-test.sh` (no sudo): it shows what the kernel and PipeWire see, records
+6 s twice with 20 s of silence in between, prints both levels and plays both back. It records the way
+applications do and selects no port.
 
-| After the power-up | Level on pin `0x18` |
-|---|---|
-| everything restored, input amplifier of ADC `0x07` as the chip has it | digital silence: the chip reads mute (`0x80`) while the kernel's cache holds the `Capture` setting |
-| amplifier opened by hand | -68 dBFS: the headset block is dead |
-| bias switched off and on | -68 dBFS |
-| type detection run again | -42 dBFS: alive |
+**Two approaches that did not work,** kept here so nobody repeats them:
 
-So the patch runs the detection again and syncs the ADC from the cache when the next recording starts. The
-detection is not repeated on every power-up because it lifts the headphone ground for a moment.
-
-**Use.** Apply after 0018 and build. `./install-0019.sh` installs the packages the same way as
-`install-0018.sh` (`./install-0019.sh off` / `on` writes or removes the option). After the reboot plug the
-headset in and run `tools/headset-mic-test.sh` (no sudo): it shows what the kernel and PipeWire see, records
-6 s from the "Microphone" port twice, with 20 s of silence in between so the codec powers down, and plays both
-back.
+- Running the detection again when a recording starts, instead of keeping the codec powered: it passed the
+  test script but a voice chat got no input.
+- Re-syncing the ADC node from the kernel's cache when a recording starts: that sync is exactly what mutes the
+  amplifier (cause 2).
 
 ## Not done yet
 
-- Tuning by ear.
-- Start after a reboot. The first version failed there: its start check ran `aplay -l` 0.7 s before logind
-  granted the session access to `/dev/snd`, saw no cards and the unit was skipped. The check now reads
-  `/proc/asound` and the service waits up to 60 s for device access. Fixed, but not yet confirmed by a reboot.
-  A PipeWire restart is confirmed to bring the service back.
+- Speaker tuning is by ear, not measured.
+- Headset: the buttons, the second pinout (type 1), and the power cost of keeping the codec awake.
+
+Start after a reboot is confirmed (several reboots on 2026-10-13). An earlier version of the service failed
+there: its start check ran `aplay -l` 0.7 s before logind granted the session access to `/dev/snd`, saw no cards
+and the unit was skipped. The check now reads `/proc/asound` and the service waits up to 60 s for device access.
 
 ## Sources
 

@@ -39,15 +39,27 @@ Two things do not survive a power-down of the codec, both measured on the
 patched kernel:
 
 * The headset block.  After the power-up, with every coefficient and GPIO
-  back at its value, pin 0x18 gives -68 dBFS; a new detection brings the
-  microphone back (-42 dBFS).  Since the detection lifts the headphone
-  ground for a moment, it is not repeated on every power-up but when the
-  next recording is prepared.
-* The input amplifier of the ADC.  The chip reads 0x80 (mute) while the amp
-  cache holds the "Capture" setting, so writing the same value again does
-  nothing and recordings are digital silence.  The ADC node is synced from
-  the cache when a recording is prepared and when a running recording moves
-  to the headset ADC.
+  back at its value, pin 0x18 gives -68 dBFS; only a new detection brings
+  the microphone back (-42 dBFS).  A first attempt ran the detection again
+  when the next recording was prepared; that failed in real use (a voice
+  chat reported no input).  So the codec is now kept powered while a
+  headset with a microphone is plugged in, which is what macOS has to do
+  anyway for the headset buttons, and the microphone pin keeps its power
+  between recordings.  Plain headphones do not hold the codec up; their
+  state is restored after a power-up without a new detection, because the
+  detection lifts the headphone ground for a moment.
+* The input amplifier of the ADC.  The chip reads 0x80 (mute) while the
+  "Capture" control says on, and recordings are digital silence.  The
+  cause is not the power-down itself: cs4208_probe() does not set
+  single_adc_amp, unlike cs420x_probe().  ADC 0x07 has three inputs but
+  one amplifier (all three index pairs always read the same), so the amp
+  cache holds three values, "Capture" drives only the selected index and
+  the other two stay at their initial mute.  Every regcache sync writes all
+  three and the chip keeps the last one, a mute.  Checked without root:
+  writing the same "Capture" value changes nothing, a changed value opens
+  the amplifier (0x3f), and a sync of the node closes it again (0x80).
+  Set single_adc_amp for the CS4208 as well.  This part is not specific to
+  the MacBookPro11,x.
 
 The line for type 1 (the other pinout) follows AppleHDA and is not tested.
 The headset buttons (tag 0x2f) are not handled.  The module parameter
@@ -55,12 +67,12 @@ headset_mic=0 turns all of this off.
 
 Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 ---
- sound/hda/codecs/cirrus/cs420x.c |  388 ++++++++++++++++++++++++++++++++++++++
- 1 file changed, 386 insertions(+), 2 deletions(-)
+ sound/hda/codecs/cirrus/cs420x.c |  390 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 388 insertions(+), 2 deletions(-)
 
 --- a/sound/hda/codecs/cirrus/cs420x.c
 +++ b/sound/hda/codecs/cirrus/cs420x.c
-@@ -8,10 +8,13 @@
+@@ -8,6 +8,8 @@
  #include <linux/init.h>
  #include <linux/slab.h>
  #include <linux/module.h>
@@ -69,12 +81,7 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
  #include <sound/core.h>
  #include <linux/pci.h>
  #include <sound/tlv.h>
- #include <sound/hda_codec.h>
-+#include <sound/hda_regmap.h>
- #include "hda_local.h"
- #include "hda_auto_parser.h"
- #include "hda_jack.h"
-@@ -33,6 +36,11 @@
+@@ -33,6 +35,11 @@
  MODULE_PARM_DESC(split_speakers,
  		 "CS4208 MacBookPro11,x: second speaker pair on its own PCM device (default=0)");
  
@@ -86,7 +93,7 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
  struct cs_spec {
  	struct hda_gen_spec gen;
  
-@@ -47,6 +55,21 @@
+@@ -47,6 +54,21 @@
  	/* for MBP SPDIF control */
  	int (*spdif_sw_put)(struct snd_kcontrol *kcontrol,
  			    struct snd_ctl_elem_value *ucontrol);
@@ -104,11 +111,11 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +	unsigned int hs_plugged:1;	/* something is in the combo jack */
 +	unsigned int hs_detecting:1;	/* type detection is running */
 +	unsigned int hs_mic:1;		/* reported as presence of pin 0x18 */
-+	unsigned int hs_stale:1;	/* powered down since the detection */
++	unsigned int hs_powered:1;	/* codec kept powered for the headset */
  };
  
  /* available models with CS420x */
-@@ -147,6 +170,7 @@
+@@ -147,6 +169,7 @@
  		else
  			spec->gpio_data =
  				spec->gpio_eapd_hp | spec->gpio_eapd_speaker;
@@ -116,7 +123,7 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
  		snd_hda_codec_write(codec, 0x01, 0,
  				    AC_VERB_SET_GPIO_DATA, spec->gpio_data);
  	}
-@@ -266,6 +290,342 @@
+@@ -266,6 +289,333 @@
  	cs_vendor_coef_set(codec, IDX_SPDIF_CTL, coef);
  }
  
@@ -146,12 +153,12 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 + * Two things do not survive a power-down of the codec, both measured:
 + *
 + *  - The headset block: with all coefficients and GPIOs restored the
-+ *    microphone stays silent until the detection has run again.  The
-+ *    detection lifts the headphone ground for a moment, so it is not repeated
-+ *    on every power-up, only when the next recording starts.
-+ *  - The input amplifier of the ADC: the chip is back at mute while the amp
-+ *    cache still holds the "Capture" setting, so the regular cache sync
-+ *    writes nothing.  The ADC node is synced when a recording starts.
++ *    microphone stays silent until the detection has run again.  Detecting
++ *    again whenever a recording starts proved unreliable, so the codec is
++ *    kept powered while a headset with a microphone is plugged in, as macOS
++ *    has to do for the headset buttons.  Plain headphones do not need that.
++ *  - The input amplifier of the ADC, until single_adc_amp was set for the
++ *    CS4208, see cs4208_probe().
 + */
 +#define CS4208_HP_PIN			0x10
 +#define CS4208_HS_MIC_PIN		0x18
@@ -203,9 +210,20 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +	if (jack)
 +		snd_hda_jack_unsol_event(codec,
 +					 jack->tag << AC_UNSOL_RES_TAG_SHIFT);
-+	/* a running recording has just moved to the other ADC */
-+	if (spec->gen.cur_adc)
-+		snd_hdac_regmap_sync_node(&codec->core, spec->gen.cur_adc);
++}
++
++/* keep the codec powered while a headset microphone is in use */
++static void cs4208_hs_keep_power(struct hda_codec *codec, bool on)
++{
++	struct cs_spec *spec = codec->spec;
++
++	if (spec->hs_powered == on)
++		return;
++	spec->hs_powered = on;
++	if (on)
++		snd_hda_power_up_pm(codec);
++	else
++		snd_hda_power_down_pm(codec);
 +}
 +
 +/*
@@ -230,6 +248,7 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +	else		/* bias off */
 +		cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS,
 +				      0x0172, 0x0112);
++	cs4208_hs_keep_power(codec, type < 2);
 +}
 +
 +static void cs4208_hs_stop_detect(struct hda_codec *codec)
@@ -298,18 +317,13 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +	cs4208_hs_report(codec, type < 2);
 +}
 +
-+/* the combo jack was plugged or unplugged */
-+static void cs4208_hs_jack_update(struct hda_codec *codec)
++/* start over for a new plug state; called with hs_lock held */
++static void cs4208_hs_set_plugged(struct hda_codec *codec, bool plugged)
 +{
 +	struct cs_spec *spec = codec->spec;
-+	bool plugged = snd_hda_jack_detect(codec, CS4208_HP_PIN);
 +
-+	guard(mutex)(&spec->hs_lock);
-+	if (plugged == spec->hs_plugged)
-+		return;
 +	spec->hs_plugged = plugged;
 +	spec->hs_type = -1;
-+	spec->hs_stale = 0;
 +	cancel_delayed_work(&spec->hs_work);
 +	cs4208_hs_stop_detect(codec);
 +	if (plugged) {
@@ -329,7 +343,19 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +		cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0);
 +		cs_vendor_coef_set(codec, CS4208_IDX_HS_BIAS, 0);
 +		cs4208_hs_report(codec, false);
++		cs4208_hs_keep_power(codec, false);
 +	}
++}
++
++/* the combo jack was plugged or unplugged */
++static void cs4208_hs_jack_update(struct hda_codec *codec)
++{
++	struct cs_spec *spec = codec->spec;
++	bool plugged = snd_hda_jack_detect(codec, CS4208_HP_PIN);
++
++	guard(mutex)(&spec->hs_lock);
++	if (plugged != spec->hs_plugged)
++		cs4208_hs_set_plugged(codec, plugged);
 +}
 +
 +static void cs4208_hs_jack_event(struct hda_codec *codec,
@@ -344,60 +370,31 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +	struct cs_spec *spec = codec->spec;
 +	bool plugged = snd_hda_jack_detect(codec, CS4208_HP_PIN);
 +
-+	scoped_guard(mutex, &spec->hs_lock) {
-+		/* "JackConfig1" and "JackConfig2" of layout 94 */
-+		cs_vendor_coef_set(codec, CS4208_IDX_JACK_CFG1, 0x4493);
-+		cs_vendor_coef_set(codec, CS4208_IDX_JACK_CFG2, 0x1b13);
-+		if (plugged && spec->hs_plugged && spec->hs_type >= 0) {
-+			/*
-+			 * Same plug as before the power-down: restore the lines
-+			 * and leave the new detection to the next recording.
-+			 */
-+			snd_hda_codec_write(codec, spec->vendor_nid, 0,
-+					    CS4208_VERB_HS_IRQ_MASK, 0xae);
-+			cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0x8383);
-+			cs4208_hs_set_type(codec, spec->hs_type);
-+			spec->hs_stale = spec->hs_type < 2;
-+			return;
-+		}
-+		cancel_delayed_work(&spec->hs_work);
-+		cs4208_hs_stop_detect(codec);
-+		cs_vendor_coef_set(codec, CS4208_IDX_HS_BIAS, 0);
-+		cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0);
-+		cs4208_hs_set_fets(codec, 0);
-+		spec->hs_plugged = 0;
-+		spec->hs_type = -1;
-+		spec->hs_stale = 0;
-+	}
-+	cs4208_hs_jack_update(codec);
-+}
-+
-+/* a recording starts: bring back what the last power-down has lost */
-+static void cs4208_hs_capture_hook(struct hda_pcm_stream *hinfo,
-+				   struct hda_codec *codec,
-+				   struct snd_pcm_substream *substream,
-+				   int action)
-+{
-+	struct cs_spec *spec = codec->spec;
-+
-+	if (action != HDA_GEN_PCM_ACT_PREPARE)
-+		return;
-+	snd_hdac_regmap_sync_node(&codec->core, spec->gen.cur_adc ?
-+				  spec->gen.cur_adc : hinfo->nid);
-+
 +	guard(mutex)(&spec->hs_lock);
-+	if (!spec->hs_stale || !spec->hs_plugged || spec->hs_detecting)
++	/* "JackConfig1" and "JackConfig2" of layout 94 */
++	cs_vendor_coef_set(codec, CS4208_IDX_JACK_CFG1, 0x4493);
++	cs_vendor_coef_set(codec, CS4208_IDX_JACK_CFG2, 0x1b13);
++	if (plugged && spec->hs_plugged && spec->hs_type >= 2) {
++		/*
++		 * The same headphones as before the power-down: nothing to
++		 * detect, and a detection would lift their ground.
++		 */
++		cs4208_hs_set_type(codec, spec->hs_type);
 +		return;
-+	spec->hs_stale = 0;
-+	spec->hs_type = -1;
-+	spec->hs_retries = 0;
-+	cs4208_hs_coef_update(codec, CS4208_IDX_HP_CLAMP, 0x2000, 0x2000);
-+	mod_delayed_work(system_wq, &spec->hs_work,
-+			 msecs_to_jiffies(CS4208_HS_DETECT_DELAY));
++	}
++	/*
++	 * A headset keeps the codec powered, so this is the first init or a
++	 * system resume: the headset block has to detect again.
++	 */
++	cs_vendor_coef_set(codec, CS4208_IDX_HS_BIAS, 0);
++	cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0);
++	if (!plugged)
++		cs4208_hs_set_fets(codec, 0);
++	cs4208_hs_set_plugged(codec, plugged);
 +}
 +
 +/* stop a running detection; it starts again from cs4208_hs_init() */
-+static void cs4208_hs_shutdown(struct hda_codec *codec)
++static void cs4208_hs_stop(struct hda_codec *codec, bool release)
 +{
 +	struct cs_spec *spec = codec->spec;
 +
@@ -405,9 +402,10 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +	guard(mutex)(&spec->hs_lock);
 +	if (spec->hs_detecting) {
 +		spec->hs_detecting = 0;
-+		spec->hs_plugged = 0;
 +		snd_hda_power_down_pm(codec);
 +	}
++	if (release)
++		cs4208_hs_keep_power(codec, false);
 +}
 +
 +/* pin 0x18 cannot sense its plug: answer with the detector's verdict */
@@ -443,7 +441,7 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +	struct cs_spec *spec = codec->spec;
 +
 +	if (spec->hs_enabled)
-+		cs4208_hs_shutdown(codec);
++		cs4208_hs_stop(codec, false);
 +	return 0;
 +}
 +
@@ -452,14 +450,14 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +	struct cs_spec *spec = codec->spec;
 +
 +	if (spec->hs_enabled)
-+		cs4208_hs_shutdown(codec);
++		cs4208_hs_stop(codec, true);
 +	snd_hda_gen_remove(codec);
 +}
 +
  static int cs_init(struct hda_codec *codec)
  {
  	struct cs_spec *spec = codec->spec;
-@@ -294,6 +654,9 @@
+@@ -294,6 +644,9 @@
  		init_digital_coef(codec);
  	}
  
@@ -469,7 +467,7 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
  	return 0;
  }
  
-@@ -692,6 +1055,26 @@
+@@ -692,6 +1045,27 @@
  
  	cs4208_fixup_spdif_switch(codec, fix, action);
  
@@ -488,7 +486,8 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
 +							    cs4208_hs_jack_event);
 +			spec->gpio_mask |= CS4208_HS_GPIO_MASK;
 +			spec->gpio_dir |= CS4208_HS_GPIO_MASK;
-+			gen->pcm_capture_hook = cs4208_hs_capture_hook;
++			/* the bias must not drop between two recordings */
++			snd_hda_gen_fix_pin_power(codec, CS4208_HS_MIC_PIN);
 +			spec->hs_enabled = 1;
 +		}
 +	}
@@ -496,7 +495,25 @@ Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
  	/* after the pin parser has assigned the DACs, before the PCMs are built */
  	if (action != HDA_FIXUP_ACT_PROBE || !split_speakers)
  		return;
-@@ -796,11 +1179,12 @@
+@@ -755,6 +1129,17 @@
+ 	/* exclude NID 0x10 (HP) from output volumes due to different steps */
+ 	spec->gen.out_vol_mask = 1ULL << 0x10;
+ 
++	/*
++	 * As on the CS4206/4207, an ADC has one input amplifier whatever its
++	 * connection index.  Without this the amp cache holds one value per
++	 * index, "Capture" drives only the selected one and the others stay at
++	 * their initial mute; every regcache sync then writes them all and the
++	 * last one, a mute, is what the chip keeps.  Seen on ADC 0x07 (three
++	 * inputs): recordings from the headset microphone were digital
++	 * silence after each power-up.
++	 */
++	codec->single_adc_amp = 1;
++
+ 	snd_hda_pick_fixup(codec, cs4208_models, cs4208_fixup_tbl,
+ 			   cs4208_fixups);
+ 	snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_PRE_PROBE);
+@@ -796,11 +1181,12 @@
  
  static const struct hda_codec_ops cs_codec_ops = {
  	.probe = cs_codec_probe,
