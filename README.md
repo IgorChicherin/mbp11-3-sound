@@ -24,7 +24,7 @@ completely silent, also with raw ALSA (`hw:1,0`, 4 channels).
 
 ## The patch
 
-`patches/0018-cs4208-split-speakers.patch` (against Linux 6.18, `sound/hda/codecs/cirrus/cs420x.c`) adds a
+`patches/0001-cs4208-split-speakers.patch` (against Linux 6.18, `sound/hda/codecs/cirrus/cs420x.c`) adds a
 module parameter:
 
 ```
@@ -49,9 +49,9 @@ With the split on and no crossover in userspace, desktop sound comes from the tw
    ```
 
    It applies `patches/*.patch` in order, skips what is already in the tree, and changes nothing unless the
-   whole series goes in. `--reverse` takes the patches out again. The numbers 0018 and 0019 are the patches'
-   places in the `linux-lts-mbp` series of the [reclocked fork](https://github.com/IgorChicherin/reclocked),
-   whose build applies them by itself.
+   whole series goes in. `--reverse` takes the patches out again. To build them into the `linux-lts-mbp`
+   package of the [reclocked fork](https://github.com/IgorChicherin/reclocked) (dGPU patches for the same
+   machine), pass this repo's `patches/` to its generator: `./mkpkgbuild.sh --extra-patches=<this repo>/patches`.
 2. Turn the speaker split on (the headset part needs no option) and reboot:
 
    ```
@@ -152,7 +152,7 @@ three and the chip keeps the last one, a mute: recordings are digital silence al
 This is a driver bug for every CS4208 machine, not only this model; nobody noticed because the path was never
 used.
 
-**The patch.** `patches/0019-cs4208-mbp11-headset-mic.patch` (on top of 0018):
+**The patch.** `patches/0002-cs4208-mbp11-headset-mic.patch` (on top of 0001):
 
 - When something is plugged into the jack, the driver runs the codec's type detection, sets the two GPIOs by
   the answer and reports the result as the presence of pin `0x18`. `Mic Jack` and the automatic microphone

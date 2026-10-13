@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the speaker crossover for the current user (no sudo). Needs kernel patch 0018 with split_speakers=1.
+# Install the speaker crossover for the current user (no sudo). Needs the speaker kernel patch with split_speakers=1.
 #   ./setup.sh          install + start; "MacBook Speakers" becomes the default output
 #   ./setup.sh undo     stop and remove; sound goes back to the plain output (tweeters only while the split is on)
 set -euo pipefail

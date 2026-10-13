@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# After patch 0019: does the headset microphone come up by itself? (no sudo)
+# With the headset patch (0002): does the headset microphone come up by itself? (no sudo)
 # Plug the headset in first. Shows what the kernel and PipeWire see, then records 6 s from the built-in card's
 # input twice, with 20 s of silence in between (that pause killed the microphone in earlier versions), and
 # plays both back. It records the way applications do: it does not select a port or touch any mixer control.
@@ -8,7 +8,7 @@ set -euo pipefail
 export LC_ALL=C
 src=alsa_input.pci-0000_00_1b.0.analog-stereo
 p=/sys/module/snd_hda_codec_cs420x/parameters/headset_mic
-[[ -r $p ]] || { echo "ERROR: this kernel has no patch 0019 ($p missing)" >&2; exit 1; }
+[[ -r $p ]] || { echo "ERROR: this kernel lacks the headset patch ($p missing)" >&2; exit 1; }
 echo "headset_mic parameter: $(<"$p")"
 amixer -c PCH contents | grep -A2 -E "name='(Mic|Headphone) Jack'" | grep -E 'name=|: values' | paste - - | sed 's/numid=[0-9]*,iface=CARD,//'
 awk '/^GPIO/ {p=1} p && /IO\[[045]\]/' /proc/asound/PCH/codec#0
@@ -32,9 +32,9 @@ rec() {
   timeout 6 pw-record --target "$src" --rate 48000 --channels 2 --format s16 "$2" || true
   echo "    level in the last 4 s: $(level "$2")"
 }
-rec "recording 1" "$out/headset-0019-1.wav"
+rec "recording 1" "$out/headset-test-1.wav"
 echo ">>> now stay QUIET for 20 s (this pause killed the microphone in earlier versions)"
 sleep 20
-rec "recording 2, after the power-down" "$out/headset-0019-2.wav"
+rec "recording 2, after the power-down" "$out/headset-test-2.wav"
 echo ">>> playing both back"
-pw-play "$out/headset-0019-1.wav"; pw-play "$out/headset-0019-2.wav"
+pw-play "$out/headset-test-1.wav"; pw-play "$out/headset-test-2.wav"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MacBookPro11,3 speaker crossover on top of kernel patch 0018 (split_speakers=1). No sudo anywhere.
+# MacBookPro11,3 speaker crossover on top of the speaker kernel patch (split_speakers=1). No sudo anywhere.
 # One virtual output, "MacBook Speakers", takes stereo and sends highs to the tweeters (hw:PCH,0) and lows to
 # the woofers (hw:PCH,2). On headphones the plain ALSA output is used instead (full range).
 #   mbp-speakers check              exit 0 if this kernel has the split on (used by the systemd unit)
@@ -203,7 +203,7 @@ case ${1:-} in
     load_params
     for k in $keys; do echo "$k=${!k}"; done
     [[ -r $limiter_so ]] && echo "limiter: on ($limiter_so)" || echo "limiter: off (install swh-plugins); LOUD and LIMIT are ignored"
-    echo "split: $(cat "$split" 2>/dev/null || echo 'no patch 0018')   service: $(systemctl --user is-active mbp-speakers.service 2>/dev/null)   default: $(pactl get-default-sink 2>/dev/null)"
+    echo "split: $(cat "$split" 2>/dev/null || echo 'no speaker patch')   service: $(systemctl --user is-active mbp-speakers.service 2>/dev/null)   default: $(pactl get-default-sink 2>/dev/null)"
     ;;
   tune)
     load_params; shift

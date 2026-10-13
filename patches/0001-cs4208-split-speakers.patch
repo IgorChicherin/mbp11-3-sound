@@ -1,7 +1,7 @@
-From 0018-cs4208-split-speakers Mon Sep 17 00:00:00 2001
+From 0001-cs4208-split-speakers Mon Sep 17 00:00:00 2001
 From: Igor Chicherin <ashzak990@gmail.com>
 Date: Tue, 13 Oct 2026 00:00:00 +0300
-Subject: [PATCH 0018/0018] ALSA: hda/cs420x: optional separate PCM for the second MacBookPro11,x speaker pair
+Subject: [PATCH 1/2] ALSA: hda/cs420x: optional separate PCM for the second MacBookPro11,x speaker pair
 
 The MacBookPro11,x drives two stereo speaker pairs from two stereo DACs of
 the CS4208: DAC 0x03 -> pin 0x12 ("Speaker") and DAC 0x04 -> pin 0x13

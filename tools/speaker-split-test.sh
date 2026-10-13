@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# After patch 0018 with split_speakers=1: do the two speaker pairs play two independent PCM devices? (no sudo)
+# With the speaker patch (0001) and split_speakers=1: do the two speaker pairs play two independent PCM devices? (no sudo)
 #   1  HIGH tone (1 kHz) on hw:PCH,0 only    -> first pair  ("Speaker")
 #   2  LOW tone (500 Hz) on hw:PCH,2 only    -> second pair ("Bass Speaker")
 #   3  both at once                          -> both tones together
@@ -8,7 +8,7 @@
 set -euo pipefail
 card=alsa_card.pci-0000_00_1b.0
 p=/sys/module/snd_hda_codec_cs420x/parameters/split_speakers
-[[ -r $p ]] || { echo "ERROR: this kernel has no patch 0018 ($p missing)" >&2; exit 1; }
+[[ -r $p ]] || { echo "ERROR: this kernel lacks the speaker patch ($p missing)" >&2; exit 1; }
 [[ $(<"$p") == Y ]] || { echo "ERROR: split_speakers is off (see /etc/modprobe.d/cs4208-split.conf)" >&2; exit 1; }
 aplay -l | grep -q 'card 1: PCH.*device 2' || { echo "ERROR: no PCM device 2 on the PCH card:"; aplay -l | grep PCH; exit 1; } >&2
 old=$(pactl list cards | awk -v c="$card" '$1=="Name:"{p=($2==c)} p&&/Active Profile:/{print $3; exit}')

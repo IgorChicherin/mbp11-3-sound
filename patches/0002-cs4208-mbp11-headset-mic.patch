@@ -1,7 +1,7 @@
-From 0019-cs4208-mbp11-headset-mic Mon Sep 17 00:00:00 2001
+From 0002-cs4208-mbp11-headset-mic Mon Sep 17 00:00:00 2001
 From: Igor Chicherin <ashzak990@gmail.com>
 Date: Tue, 13 Oct 2026 00:00:00 +0300
-Subject: [PATCH 0019/0019] ALSA: hda/cs420x: headset microphone on MacBookPro11,2/11,3
+Subject: [PATCH 2/2] ALSA: hda/cs420x: headset microphone on MacBookPro11,2/11,3
 
 A headset microphone in the combo jack of the MacBookPro11,2/11,3 never
 works: "Mic Jack" stays off, and forcing the capture path to pin 0x18 gives

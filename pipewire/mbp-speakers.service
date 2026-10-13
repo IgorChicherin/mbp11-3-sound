@@ -2,7 +2,7 @@
 Description=MacBook Pro 11,3 speaker crossover (tweeters + woofers)
 After=pipewire.service wireplumber.service pipewire-pulse.service
 BindsTo=pipewire.service
-# Only on a kernel with patch 0018; on any other kernel the plain stereo output keeps working untouched.
+# Only on a kernel with the speaker patch; on any other kernel the plain stereo output keeps working untouched.
 ConditionPathExists=/sys/module/snd_hda_codec_cs420x/parameters/split_speakers
 
 [Service]
