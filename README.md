@@ -115,7 +115,10 @@ the microphone.
 ## Not done yet
 
 - Tuning by ear.
-- Headphone unplug check; behaviour after a PipeWire restart and after a reboot.
+- Start after a reboot. The first version failed there: its start check ran `aplay -l` 0.7 s before logind
+  granted the session access to `/dev/snd`, saw no cards and the unit was skipped. The check now reads
+  `/proc/asound` and the service waits up to 60 s for device access. Fixed, but not yet confirmed by a reboot.
+  A PipeWire restart is confirmed to bring the service back.
 
 ## Sources
 

@@ -39,7 +39,11 @@ save_params() {
   mkdir -p "${params%/*}"
   for k in $keys; do echo "$k=${!k}"; done >"$params"
 }
-check() { [[ -r $split && $(<"$split") == Y ]] && aplay -l 2>/dev/null | grep -q "card [0-9]*: $card .*device 2:"; }
+# Must not touch /dev/snd: at login this runs before logind has granted the session access to the sound devices
+# (the user is not in the audio group), and anything that opens them, like "aplay -l", then sees no cards.
+check() { [[ -r $split && $(<"$split") == Y && -d /proc/asound/$card/pcm2p ]]; }
+# The woofer PCM node, once this user may open it.
+pcm_ready() { local n; n=$(readlink /proc/asound/$card) && [[ -r /dev/snd/pcmC${n#card}D2p && -w /dev/snd/pcmC${n#card}D2p ]]; }
 lin() { awk -v d="$1" 'BEGIN { printf "%.4f", 10 ^ (d / 20) }'; }
 node_id() { pw-cli ls Node 2>/dev/null | awk -v n="\"$1\"" '$1=="id" {id=$2+0} $1=="node.name" && $3==n {print id; exit}'; }
 have_sink() { pactl list short sinks 2>/dev/null | awk -v n="$1" '$2==n {f=1} END {exit !f}'; }
@@ -161,7 +165,9 @@ run() {
   local id pw clock i
   check || { echo "split_speakers is off or hw:$card,2 is missing; nothing to do" >&2; exit 1; }
   load_params; save_params; gen_conf
-  for i in {1..30}; do pactl info >/dev/null 2>&1 && have_sink "$raw" && break; sleep 0.5; done
+  # Up to 60 s: at login the device access and PipeWire's own sink arrive a moment after this service starts.
+  for i in {1..120}; do pcm_ready && pactl info >/dev/null 2>&1 && have_sink "$raw" && break; sleep 0.5; done
+  pcm_ready && have_sink "$raw" || { echo "no access to hw:$card,2 or PipeWire's sink $raw is missing" >&2; exit 2; }
   id=$(node_id mbp_woofers); [[ -n $id ]] && pw-cli destroy "$id" >/dev/null || true
   # Same clock name as the tweeter PCM: one card, one clock, so PipeWire must not resample between them.
   clock=$(pw-cli e "$(node_id "$raw")" Props 2>/dev/null | tr -d '\n' | sed -n 's/.*String "clock.name" *String "\([^"]*\)".*/\1/p')
