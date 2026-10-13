@@ -1,0 +1,513 @@
+From 0019-cs4208-mbp11-headset-mic Mon Sep 17 00:00:00 2001
+From: Igor Chicherin <ashzak990@gmail.com>
+Date: Tue, 13 Oct 2026 00:00:00 +0300
+Subject: [PATCH 0019/0019] ALSA: hda/cs420x: headset microphone on MacBookPro11,2/11,3
+
+A headset microphone in the combo jack of the MacBookPro11,2/11,3 never
+works: "Mic Jack" stays off, and forcing the capture path to pin 0x18 gives
+only noise, with any VREF setting.
+
+The CS4208 has a headset block behind the vendor widget (0x24) that the
+driver does not use.  How macOS drives it was read from AppleHDA 10.13.6
+(class AppleHDAMikeyInternalCS4208 and layout 94, which belongs to codec
+subsystem 106b:5e00), and each step was then verified on a MacBookPro11,3
+with hda-verb and the hda_unsol_event tracepoint:
+
+* GPIO5 and GPIO4 control two depletion FETs ("USDFETControl",
+  "CHDFETControl" in the layout).  A FET grounds one of the two possible
+  microphone contacts while its GPIO is low.  The driver leaves both GPIOs
+  undriven, so the microphone is always shorted: -68 dBFS on pin 0x18, and
+  the codec's own detector answers "headphones".
+* With both GPIOs high, the pin bias on and coefficient 0x19 = 0xc383, the
+  codec runs a type detection and answers with an unsolicited response
+  carrying the fixed tag 0x2e: bit 2 = valid, bits 1:0 = 0 or 1 for the two
+  headset pinouts, 2 or 3 for headphones.  A CTIA headset gives payload
+  0x44, type 0.
+* For type 0, GPIO5 high and GPIO4 low gives speech on pin 0x18 (-35 dBFS
+  while talking against -46 dBFS in silence, at the top gain); GPIO5 low
+  and GPIO4 high gives silence.
+
+Implement that for subsystem 106b:5e00: on a plug event of the headphone
+pin run the detection (250 ms later, with one timeout and the retries
+AppleHDA does), set the FET lines by the result, and report the result as
+the presence of pin 0x18 by answering its GET_PIN_SENSE, as cs8409 does for
+its virtual pins.  The generic auto-mic switching and the "Mic Jack"
+control then work as for any other jack.  The jack configuration
+coefficients 0x33/0x34 get the layout's values (0x4493, 0x1b13).
+
+Two things do not survive a power-down of the codec, both measured on the
+patched kernel:
+
+* The headset block.  After the power-up, with every coefficient and GPIO
+  back at its value, pin 0x18 gives -68 dBFS; a new detection brings the
+  microphone back (-42 dBFS).  Since the detection lifts the headphone
+  ground for a moment, it is not repeated on every power-up but when the
+  next recording is prepared.
+* The input amplifier of the ADC.  The chip reads 0x80 (mute) while the amp
+  cache holds the "Capture" setting, so writing the same value again does
+  nothing and recordings are digital silence.  The ADC node is synced from
+  the cache when a recording is prepared and when a running recording moves
+  to the headset ADC.
+
+The line for type 1 (the other pinout) follows AppleHDA and is not tested.
+The headset buttons (tag 0x2f) are not handled.  The module parameter
+headset_mic=0 turns all of this off.
+
+Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
+---
+ sound/hda/codecs/cirrus/cs420x.c |  388 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 386 insertions(+), 2 deletions(-)
+
+--- a/sound/hda/codecs/cirrus/cs420x.c
++++ b/sound/hda/codecs/cirrus/cs420x.c
+@@ -8,10 +8,13 @@
+ #include <linux/init.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
+ #include <sound/core.h>
+ #include <linux/pci.h>
+ #include <sound/tlv.h>
+ #include <sound/hda_codec.h>
++#include <sound/hda_regmap.h>
+ #include "hda_local.h"
+ #include "hda_auto_parser.h"
+ #include "hda_jack.h"
+@@ -33,6 +36,11 @@
+ MODULE_PARM_DESC(split_speakers,
+ 		 "CS4208 MacBookPro11,x: second speaker pair on its own PCM device (default=0)");
+ 
++static bool headset_mic = true;
++module_param(headset_mic, bool, 0444);
++MODULE_PARM_DESC(headset_mic,
++		 "CS4208 MacBookPro11,2/11,3: headset microphone in the combo jack (default=1)");
++
+ struct cs_spec {
+ 	struct hda_gen_spec gen;
+ 
+@@ -47,6 +55,21 @@
+ 	/* for MBP SPDIF control */
+ 	int (*spdif_sw_put)(struct snd_kcontrol *kcontrol,
+ 			    struct snd_ctl_elem_value *ucontrol);
++
++	/* MacBookPro11,x headset microphone, see cs4208_hs_*() */
++	struct hda_codec *hs_codec;
++	struct mutex hs_lock;		/* protects the hs_* state below */
++	struct delayed_work hs_work;
++	int (*hs_exec_verb)(struct hdac_device *dev, unsigned int cmd,
++			    unsigned int flags, unsigned int *res);
++	unsigned int gpio_headset;	/* FET control lines driven high */
++	int hs_type;			/* detector's verdict, -1 = unknown */
++	int hs_retries;
++	unsigned int hs_enabled:1;
++	unsigned int hs_plugged:1;	/* something is in the combo jack */
++	unsigned int hs_detecting:1;	/* type detection is running */
++	unsigned int hs_mic:1;		/* reported as presence of pin 0x18 */
++	unsigned int hs_stale:1;	/* powered down since the detection */
+ };
+ 
+ /* available models with CS420x */
+@@ -147,6 +170,7 @@
+ 		else
+ 			spec->gpio_data =
+ 				spec->gpio_eapd_hp | spec->gpio_eapd_speaker;
++		spec->gpio_data |= spec->gpio_headset;
+ 		snd_hda_codec_write(codec, 0x01, 0,
+ 				    AC_VERB_SET_GPIO_DATA, spec->gpio_data);
+ 	}
+@@ -266,6 +290,342 @@
+ 	cs_vendor_coef_set(codec, IDX_SPDIF_CTL, coef);
+ }
+ 
++/*
++ * MacBookPro11,2/11,3 headset microphone
++ *
++ * The microphone contact of the combo jack reaches pin 0x18, but the presence
++ * detection of that pin never fires and the contact is grounded by default, so
++ * a headset microphone is neither seen nor heard.
++ *
++ * The CS4208 has a headset block behind the vendor widget.  The sequence and
++ * the values below are the ones AppleHDA uses on this machine (class
++ * AppleHDAMikeyInternalCS4208, layout 94):
++ *
++ *  - Two depletion FETs, controlled by GPIO5 ("US") and GPIO4 ("CH"), ground
++ *    the two possible microphone contacts while their GPIO is low.
++ *  - With both GPIOs high and the bias on, writing 0xc383 to coefficient 0x19
++ *    starts a type detection.  The result arrives as an unsolicited response
++ *    with the fixed tag 0x2e: bit 2 = valid, bits 1:0 = 0 or 1 for the two
++ *    headset pinouts, 2 or 3 for plain headphones.
++ *  - For a headset, the FET of its ground contact is closed again and the
++ *    microphone is on pin 0x18.
++ *
++ * The verdict is reported as the presence of pin 0x18, so the generic auto-mic
++ * switching and the "Mic Jack" control work as for any other jack.
++ *
++ * Two things do not survive a power-down of the codec, both measured:
++ *
++ *  - The headset block: with all coefficients and GPIOs restored the
++ *    microphone stays silent until the detection has run again.  The
++ *    detection lifts the headphone ground for a moment, so it is not repeated
++ *    on every power-up, only when the next recording starts.
++ *  - The input amplifier of the ADC: the chip is back at mute while the amp
++ *    cache still holds the "Capture" setting, so the regular cache sync
++ *    writes nothing.  The ADC node is synced when a recording starts.
++ */
++#define CS4208_HP_PIN			0x10
++#define CS4208_HS_MIC_PIN		0x18
++#define CS4208_HS_UNSOL_TAG		0x2e	/* headset detector */
++#define CS4208_HS_BTN_UNSOL_TAG		0x2f	/* headset buttons, not used */
++#define CS4208_HS_GPIO_US		BIT(5)
++#define CS4208_HS_GPIO_CH		BIT(4)
++#define CS4208_HS_GPIO_MASK		(CS4208_HS_GPIO_US | CS4208_HS_GPIO_CH)
++#define CS4208_VERB_HS_IRQ_MASK		0x7f0
++#define CS4208_VERB_HS_BTN_IRQ_MASK	0x7f1
++#define CS4208_IDX_HP_CLAMP		0x0000	/* bit 13: headphone clamps off */
++#define CS4208_IDX_HS_DETECT		0x0019
++#define CS4208_IDX_HS_BIAS		0x001c
++#define CS4208_IDX_JACK_CFG1		0x0033
++#define CS4208_IDX_JACK_CFG2		0x0034
++#define CS4208_HS_DETECT_DELAY		250	/* ms, "HeadsetRetryTimeout" */
++#define CS4208_HS_DETECT_TIMEOUT	1000	/* ms */
++#define CS4208_HS_MAX_RETRIES		4
++
++static void cs4208_hs_coef_update(struct hda_codec *codec, unsigned int idx,
++				  unsigned int mask, unsigned int val)
++{
++	unsigned int coef = cs_vendor_coef_get(codec, idx);
++
++	cs_vendor_coef_set(codec, idx, (coef & ~mask) | val);
++}
++
++/* @open: the FET lines to drive high, i.e. the contacts to leave ungrounded */
++static void cs4208_hs_set_fets(struct hda_codec *codec, unsigned int open)
++{
++	struct cs_spec *spec = codec->spec;
++
++	spec->gpio_headset = open;
++	spec->gpio_data = (spec->gpio_data & ~CS4208_HS_GPIO_MASK) | open;
++	snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_DATA,
++			    spec->gpio_data);
++}
++
++/* tell the generic code whether pin 0x18 has a microphone now */
++static void cs4208_hs_report(struct hda_codec *codec, bool mic)
++{
++	struct cs_spec *spec = codec->spec;
++	struct hda_jack_tbl *jack;
++
++	if (spec->hs_mic == mic)
++		return;
++	spec->hs_mic = mic;
++	jack = snd_hda_jack_tbl_get(codec, CS4208_HS_MIC_PIN);
++	if (jack)
++		snd_hda_jack_unsol_event(codec,
++					 jack->tag << AC_UNSOL_RES_TAG_SHIFT);
++	/* a running recording has just moved to the other ADC */
++	if (spec->gen.cur_adc)
++		snd_hdac_regmap_sync_node(&codec->core, spec->gen.cur_adc);
++}
++
++/*
++ * Apply the detector's verdict: 0 and 1 are the two headset pinouts, 2 and 3
++ * mean no microphone.  Type 0 is verified on a MacBookPro11,3; the line for
++ * type 1 follows AppleHDA.
++ */
++static void cs4208_hs_set_type(struct hda_codec *codec, int type)
++{
++	static const unsigned int open_fets[4] = {
++		CS4208_HS_GPIO_US, CS4208_HS_GPIO_CH, 0, 0
++	};
++	struct cs_spec *spec = codec->spec;
++
++	spec->hs_type = type;
++	cs4208_hs_set_fets(codec, open_fets[type & 3]);
++	/* headphone clamps on again */
++	cs4208_hs_coef_update(codec, CS4208_IDX_HP_CLAMP, 0x2000, 0);
++	if (type < 2)	/* bias from the pin's VREF, auto-clamp on */
++		cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS,
++				      0x0172, 0x0142);
++	else		/* bias off */
++		cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS,
++				      0x0172, 0x0112);
++}
++
++static void cs4208_hs_stop_detect(struct hda_codec *codec)
++{
++	struct cs_spec *spec = codec->spec;
++
++	if (!spec->hs_detecting)
++		return;
++	spec->hs_detecting = 0;
++	cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0x8383);
++	snd_hda_power_down_pm(codec);
++}
++
++static void cs4208_hs_start_detect(struct hda_codec *codec)
++{
++	struct cs_spec *spec = codec->spec;
++
++	/* stay powered until the detector has answered */
++	snd_hda_power_up_pm(codec);
++	spec->hs_detecting = 1;
++	cs4208_hs_set_fets(codec, CS4208_HS_GPIO_MASK);
++	snd_hda_codec_write(codec, CS4208_HS_MIC_PIN, 0,
++			    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
++	cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS, 0x0030, 0);
++	cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0xc383);
++	schedule_delayed_work(&spec->hs_work,
++			      msecs_to_jiffies(CS4208_HS_DETECT_TIMEOUT));
++}
++
++/* delayed start of the detection after a plug, and its timeout */
++static void cs4208_hs_work(struct work_struct *work)
++{
++	struct cs_spec *spec = container_of(work, struct cs_spec, hs_work.work);
++	struct hda_codec *codec = spec->hs_codec;
++
++	guard(mutex)(&spec->hs_lock);
++	if (spec->hs_detecting) {
++		/* no answer: handle it as headphones */
++		cs4208_hs_stop_detect(codec);
++		cs4208_hs_set_type(codec, 2);
++		cs4208_hs_report(codec, false);
++	} else if (spec->hs_plugged && spec->hs_type < 0) {
++		cs4208_hs_start_detect(codec);
++	}
++}
++
++/* unsolicited response of the headset detector */
++static void cs4208_hs_unsol_event(struct hda_codec *codec, unsigned int res)
++{
++	struct cs_spec *spec = codec->spec;
++	int type = res & 3;
++
++	guard(mutex)(&spec->hs_lock);
++	if (!spec->hs_detecting || !(res & 4))
++		return;
++	cancel_delayed_work(&spec->hs_work);
++	cs4208_hs_stop_detect(codec);
++	if (type == 3 && spec->hs_retries++ < CS4208_HS_MAX_RETRIES) {
++		/* undecided: as AppleHDA, run the detection again */
++		schedule_delayed_work(&spec->hs_work,
++				      msecs_to_jiffies(CS4208_HS_DETECT_DELAY));
++		return;
++	}
++	codec_dbg(codec, "headset detector: type %d\n", type);
++	cs4208_hs_set_type(codec, type);
++	cs4208_hs_report(codec, type < 2);
++}
++
++/* the combo jack was plugged or unplugged */
++static void cs4208_hs_jack_update(struct hda_codec *codec)
++{
++	struct cs_spec *spec = codec->spec;
++	bool plugged = snd_hda_jack_detect(codec, CS4208_HP_PIN);
++
++	guard(mutex)(&spec->hs_lock);
++	if (plugged == spec->hs_plugged)
++		return;
++	spec->hs_plugged = plugged;
++	spec->hs_type = -1;
++	spec->hs_stale = 0;
++	cancel_delayed_work(&spec->hs_work);
++	cs4208_hs_stop_detect(codec);
++	if (plugged) {
++		snd_hda_codec_write(codec, spec->vendor_nid, 0,
++				    CS4208_VERB_HS_BTN_IRQ_MASK, 0);
++		snd_hda_codec_write(codec, spec->vendor_nid, 0,
++				    CS4208_VERB_HS_IRQ_MASK, 0xae);
++		/* headphone clamps off while the detector measures */
++		cs4208_hs_coef_update(codec, CS4208_IDX_HP_CLAMP,
++				      0x2000, 0x2000);
++		spec->hs_retries = 0;
++		schedule_delayed_work(&spec->hs_work,
++				      msecs_to_jiffies(CS4208_HS_DETECT_DELAY));
++	} else {
++		cs4208_hs_set_fets(codec, 0);
++		cs4208_hs_coef_update(codec, CS4208_IDX_HP_CLAMP, 0x2000, 0);
++		cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0);
++		cs_vendor_coef_set(codec, CS4208_IDX_HS_BIAS, 0);
++		cs4208_hs_report(codec, false);
++	}
++}
++
++static void cs4208_hs_jack_event(struct hda_codec *codec,
++				 struct hda_jack_callback *cb)
++{
++	cs4208_hs_jack_update(codec);
++}
++
++/* codec init and resume: the coefficients are back at their defaults */
++static void cs4208_hs_init(struct hda_codec *codec)
++{
++	struct cs_spec *spec = codec->spec;
++	bool plugged = snd_hda_jack_detect(codec, CS4208_HP_PIN);
++
++	scoped_guard(mutex, &spec->hs_lock) {
++		/* "JackConfig1" and "JackConfig2" of layout 94 */
++		cs_vendor_coef_set(codec, CS4208_IDX_JACK_CFG1, 0x4493);
++		cs_vendor_coef_set(codec, CS4208_IDX_JACK_CFG2, 0x1b13);
++		if (plugged && spec->hs_plugged && spec->hs_type >= 0) {
++			/*
++			 * Same plug as before the power-down: restore the lines
++			 * and leave the new detection to the next recording.
++			 */
++			snd_hda_codec_write(codec, spec->vendor_nid, 0,
++					    CS4208_VERB_HS_IRQ_MASK, 0xae);
++			cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0x8383);
++			cs4208_hs_set_type(codec, spec->hs_type);
++			spec->hs_stale = spec->hs_type < 2;
++			return;
++		}
++		cancel_delayed_work(&spec->hs_work);
++		cs4208_hs_stop_detect(codec);
++		cs_vendor_coef_set(codec, CS4208_IDX_HS_BIAS, 0);
++		cs_vendor_coef_set(codec, CS4208_IDX_HS_DETECT, 0);
++		cs4208_hs_set_fets(codec, 0);
++		spec->hs_plugged = 0;
++		spec->hs_type = -1;
++		spec->hs_stale = 0;
++	}
++	cs4208_hs_jack_update(codec);
++}
++
++/* a recording starts: bring back what the last power-down has lost */
++static void cs4208_hs_capture_hook(struct hda_pcm_stream *hinfo,
++				   struct hda_codec *codec,
++				   struct snd_pcm_substream *substream,
++				   int action)
++{
++	struct cs_spec *spec = codec->spec;
++
++	if (action != HDA_GEN_PCM_ACT_PREPARE)
++		return;
++	snd_hdac_regmap_sync_node(&codec->core, spec->gen.cur_adc ?
++				  spec->gen.cur_adc : hinfo->nid);
++
++	guard(mutex)(&spec->hs_lock);
++	if (!spec->hs_stale || !spec->hs_plugged || spec->hs_detecting)
++		return;
++	spec->hs_stale = 0;
++	spec->hs_type = -1;
++	spec->hs_retries = 0;
++	cs4208_hs_coef_update(codec, CS4208_IDX_HP_CLAMP, 0x2000, 0x2000);
++	mod_delayed_work(system_wq, &spec->hs_work,
++			 msecs_to_jiffies(CS4208_HS_DETECT_DELAY));
++}
++
++/* stop a running detection; it starts again from cs4208_hs_init() */
++static void cs4208_hs_shutdown(struct hda_codec *codec)
++{
++	struct cs_spec *spec = codec->spec;
++
++	cancel_delayed_work_sync(&spec->hs_work);
++	guard(mutex)(&spec->hs_lock);
++	if (spec->hs_detecting) {
++		spec->hs_detecting = 0;
++		spec->hs_plugged = 0;
++		snd_hda_power_down_pm(codec);
++	}
++}
++
++/* pin 0x18 cannot sense its plug: answer with the detector's verdict */
++static int cs4208_hs_exec_verb(struct hdac_device *dev, unsigned int cmd,
++			       unsigned int flags, unsigned int *res)
++{
++	struct hda_codec *codec = container_of(dev, struct hda_codec, core);
++	struct cs_spec *spec = codec->spec;
++	unsigned int nid = (cmd >> 20) & 0x7f;
++	unsigned int verb = (cmd >> 8) & 0xfff;
++
++	if (nid == CS4208_HS_MIC_PIN && verb == AC_VERB_GET_PIN_SENSE) {
++		if (res)
++			*res = spec->hs_mic ? AC_PINSENSE_PRESENCE : 0;
++		return 0;
++	}
++	return spec->hs_exec_verb(dev, cmd, flags, res);
++}
++
++static void cs_unsol_event(struct hda_codec *codec, unsigned int res)
++{
++	struct cs_spec *spec = codec->spec;
++	unsigned int tag = (res & AC_UNSOL_RES_TAG) >> AC_UNSOL_RES_TAG_SHIFT;
++
++	if (spec->hs_enabled && tag == CS4208_HS_UNSOL_TAG)
++		cs4208_hs_unsol_event(codec, res);
++	else if (!spec->hs_enabled || tag != CS4208_HS_BTN_UNSOL_TAG)
++		snd_hda_jack_unsol_event(codec, res);
++}
++
++static int cs_suspend(struct hda_codec *codec)
++{
++	struct cs_spec *spec = codec->spec;
++
++	if (spec->hs_enabled)
++		cs4208_hs_shutdown(codec);
++	return 0;
++}
++
++static void cs_remove(struct hda_codec *codec)
++{
++	struct cs_spec *spec = codec->spec;
++
++	if (spec->hs_enabled)
++		cs4208_hs_shutdown(codec);
++	snd_hda_gen_remove(codec);
++}
++
+ static int cs_init(struct hda_codec *codec)
+ {
+ 	struct cs_spec *spec = codec->spec;
+@@ -294,6 +654,9 @@
+ 		init_digital_coef(codec);
+ 	}
+ 
++	if (spec->hs_enabled)
++		cs4208_hs_init(codec);
++
+ 	return 0;
+ }
+ 
+@@ -692,6 +1055,26 @@
+ 
+ 	cs4208_fixup_spdif_switch(codec, fix, action);
+ 
++	/* the headset values are those of layout 94 only */
++	if (headset_mic && codec->core.subsystem_id == 0x106b5e00) {
++		if (action == HDA_FIXUP_ACT_PRE_PROBE) {
++			spec->hs_codec = codec;
++			spec->hs_type = -1;
++			mutex_init(&spec->hs_lock);
++			INIT_DELAYED_WORK(&spec->hs_work, cs4208_hs_work);
++			spec->hs_exec_verb = codec->core.exec_verb;
++			codec->core.exec_verb = cs4208_hs_exec_verb;
++		} else if (action == HDA_FIXUP_ACT_PROBE &&
++			   snd_hda_jack_tbl_get(codec, CS4208_HS_MIC_PIN)) {
++			snd_hda_jack_detect_enable_callback(codec, CS4208_HP_PIN,
++							    cs4208_hs_jack_event);
++			spec->gpio_mask |= CS4208_HS_GPIO_MASK;
++			spec->gpio_dir |= CS4208_HS_GPIO_MASK;
++			gen->pcm_capture_hook = cs4208_hs_capture_hook;
++			spec->hs_enabled = 1;
++		}
++	}
++
+ 	/* after the pin parser has assigned the DACs, before the PCMs are built */
+ 	if (action != HDA_FIXUP_ACT_PROBE || !split_speakers)
+ 		return;
+@@ -796,11 +1179,12 @@
+ 
+ static const struct hda_codec_ops cs_codec_ops = {
+ 	.probe = cs_codec_probe,
+-	.remove = snd_hda_gen_remove,
++	.remove = cs_remove,
+ 	.build_controls = cs_build_controls,
+ 	.build_pcms = snd_hda_gen_build_pcms,
+ 	.init = cs_init,
+-	.unsol_event = snd_hda_jack_unsol_event,
++	.unsol_event = cs_unsol_event,
++	.suspend = cs_suspend,
+ 	.stream_pm = snd_hda_gen_stream_pm,
+ };
+ 

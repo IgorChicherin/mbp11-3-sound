@@ -1,7 +1,7 @@
 # mbp-11-3-sound
 
 Separate tweeter and woofer streams for the internal speakers of the MacBook Pro 11,3 (A1398, late 2013) on
-Linux. Russian version: [README.ru.md](README.ru.md).
+Linux, and its headset microphone. Russian version: [README.ru.md](README.ru.md).
 
 **Status (2026-10-13):** the kernel patch is booted and works: the two pairs play two PCM devices
 independently. The PipeWire crossover runs and both pairs play through it; the owner rates the sound as
@@ -112,6 +112,60 @@ the internal microphone (chirp on the tweeters, then on the woofers, three cold 
 0.40-0.49 ms after the tweeters, 0.08 ms spread between starts. That figure includes the path difference to
 the microphone.
 
+## Headset microphone
+
+**Status (2026-10-13):** the first version was booted: the headset is detected at plug-in (`Mic Jack` on,
+GPIO5 high, GPIO4 low), PipeWire switches to the "Microphone" port and headphone playback works. Two faults
+showed up after a power-down of the codec (see below) and are fixed in the current patch; that second version
+builds but has **not been booted yet**.
+
+A headset microphone in the combo jack never works on this model in Linux: `Mic Jack` stays off, and forcing
+the capture path to the microphone pin (`0x18`) gives only noise.
+
+**Cause.** The CS4208 has a headset block that the driver does not use. Two FETs, controlled by GPIO5 and
+GPIO4, ground the two possible microphone contacts while their GPIO is low. The driver leaves both undriven,
+so the microphone is always shorted.
+
+| State | Level on pin `0x18` |
+|---|---|
+| stock driver | -68 dBFS, no change between talking and silence |
+| both GPIOs high, type detection run | codec answers "headset with microphone" |
+| then GPIO5 high, GPIO4 low | -35 dBFS talking, -46 dBFS silence (top gain) |
+| then GPIO5 low, GPIO4 high | -67 dBFS |
+
+How macOS drives the block was read from AppleHDA 10.13.6 (class `AppleHDAMikeyInternalCS4208` and layout 94,
+which belongs to subsystem `106b:5e00`).
+
+**The patch.** `patches/0019-cs4208-mbp11-headset-mic.patch` (on top of 0018): when something is plugged into
+the jack, the driver runs the codec's type detection, sets the two GPIOs by the answer and reports the result
+as the presence of pin `0x18`. `Mic Jack` and the automatic microphone switching then work as for any jack.
+
+```
+options snd_hda_codec_cs420x headset_mic=0     # turns it off; the default is on
+```
+
+- Only for subsystem `106b:5e00` (MacBookPro11,2/11,3): the values are those of Apple's layout for it.
+- Verified with a CTIA headset (detector type 0). The other pinout (type 1) follows AppleHDA and is untested.
+- The headset buttons are not handled.
+
+Two things do not survive a power-down of the codec (10 s of silence), both measured on the first version:
+
+| After the power-up | Level on pin `0x18` |
+|---|---|
+| everything restored, input amplifier of ADC `0x07` as the chip has it | digital silence: the chip reads mute (`0x80`) while the kernel's cache holds the `Capture` setting |
+| amplifier opened by hand | -68 dBFS: the headset block is dead |
+| bias switched off and on | -68 dBFS |
+| type detection run again | -42 dBFS: alive |
+
+So the patch runs the detection again and syncs the ADC from the cache when the next recording starts. The
+detection is not repeated on every power-up because it lifts the headphone ground for a moment.
+
+**Use.** Apply after 0018 and build. `./install-0019.sh` installs the packages the same way as
+`install-0018.sh` (`./install-0019.sh off` / `on` writes or removes the option). After the reboot plug the
+headset in and run `tools/headset-mic-test.sh` (no sudo): it shows what the kernel and PipeWire see, records
+6 s from the "Microphone" port twice, with 20 s of silence in between so the codec powers down, and plays both
+back.
+
 ## Not done yet
 
 - Tuning by ear.
@@ -125,3 +179,6 @@ the microphone.
 - [iMac16,2, CS4208, four-speaker PipeWire DSP](https://github.com/monofasesrl/imac-linux-audio-dsp)
 - [ALSA: hda/cs420x: CS4208 fixup for iMac16,1](https://ratatoskr.run/lkml/2026/05/17033263/t)
 - [MacBookPro12,1: 4.0 silent, unsolved](https://github.com/omacom/omarchy/issues/12217)
+- [Ubuntu bug 1410618: TRRS headset mic not working, CS4208 (lists a MacBookPro11,3)](https://bugs.launchpad.net/ubuntu/+source/alsa-driver/+bug/1410618)
+- [Kernel bug 155601: external mic/headset not detected, MacBookPro12,1](https://bugzilla.kernel.org/show_bug.cgi?id=155601)
+- [OpenCore Legacy Patcher](https://github.com/dortania/OpenCore-Legacy-Patcher): its binaries image carries the AppleHDA that was read
