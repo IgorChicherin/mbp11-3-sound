@@ -1,0 +1,101 @@
+From 0018-cs4208-split-speakers Mon Sep 17 00:00:00 2001
+From: Igor Chicherin <ashzak990@gmail.com>
+Date: Tue, 13 Oct 2026 00:00:00 +0300
+Subject: [PATCH 0018/0018] ALSA: hda/cs420x: optional separate PCM for the second MacBookPro11,x speaker pair
+
+The MacBookPro11,x drives two stereo speaker pairs from two stereo DACs of
+the CS4208: DAC 0x03 -> pin 0x12 ("Speaker") and DAC 0x04 -> pin 0x13
+("Bass Speaker").  The generic parser exposes them as a 4-channel PCM, but
+that PCM is completely silent, on all four drivers.
+
+Measured on a MacBookPro11,3 with hda-verb while a stream was playing:
+
+* a DAC outputs nothing while its converter format says 3 or 4 channels
+  (0x12/0x13); rewriting it to the 2-channel format (0x11) makes it play;
+* with the 2-channel format it plays only from channel offset 0; offsets 1
+  and 2 are silent, the stripe control changes nothing;
+* GPIO1 and the vendor coefficients (0x00-0x40) are identical between the
+  playing and the silent state;
+* two streams at once work: DAC 0x04 pointed at a second stream tag plays
+  that stream while DAC 0x03 keeps playing the first.
+
+So one multi-channel stream cannot feed the two pairs different signals, and
+a tweeter/woofer crossover needs one stream per pair.  Add the module
+parameter split_speakers (default off).  When set, the MBP11 fixup takes the
+second speaker DAC out of the multi-out set and hands it to the generic
+parser's alternate playback PCM ("CS4208 Alt Analog", device 2); the main
+PCM becomes plain stereo on the first pair.
+
+Without the parameter nothing changes: a stereo stream is still copied to
+both pairs.
+
+Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
+---
+ sound/hda/codecs/cirrus/cs420x.c |   42 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 41 insertions(+), 1 deletion(-)
+
+--- a/sound/hda/codecs/cirrus/cs420x.c
++++ b/sound/hda/codecs/cirrus/cs420x.c
+@@ -17,6 +17,22 @@
+ #include "hda_jack.h"
+ #include "../generic.h"
+ 
++/*
++ * MacBookPro11,x have two stereo speaker pairs on two stereo DACs (0x03 -> pin
++ * 0x12 "Speaker", 0x04 -> pin 0x13 "Bass Speaker").  The CS4208 analog DACs
++ * only play a stream whose converter format says 2 channels, and only from
++ * channel offset 0: the 4-channel "surround" PCM is silent on all four drivers,
++ * and a 2-channel format at channel offset 2 is silent too.  Two separate
++ * streams do work.  With split_speakers=1 the second pair gets its own PCM
++ * ("Alt Analog", device 2) instead of a copy of the front channels, so
++ * userspace can run a tweeter/woofer crossover.  Off by default: a plain
++ * stereo stream then reaches only the first pair.
++ */
++static bool split_speakers;
++module_param(split_speakers, bool, 0444);
++MODULE_PARM_DESC(split_speakers,
++		 "CS4208 MacBookPro11,x: second speaker pair on its own PCM device (default=0)");
++
+ struct cs_spec {
+ 	struct hda_gen_spec gen;
+ 
+@@ -667,6 +683,30 @@
+ 	}
+ }
+ 
++/* MacBookPro11,x: S/PDIF switch hook, plus the optional speaker split */
++static void cs4208_fixup_mbp11(struct hda_codec *codec,
++			       const struct hda_fixup *fix, int action)
++{
++	struct cs_spec *spec = codec->spec;
++	struct hda_gen_spec *gen = &spec->gen;
++
++	cs4208_fixup_spdif_switch(codec, fix, action);
++
++	/* after the pin parser has assigned the DACs, before the PCMs are built */
++	if (action != HDA_FIXUP_ACT_PROBE || !split_speakers)
++		return;
++	if (gen->autocfg.line_out_type != AUTO_PIN_SPEAKER_OUT ||
++	    gen->multiout.num_dacs != 2 || gen->alt_dac_nid) {
++		codec_warn(codec, "split_speakers: unexpected speaker layout, not splitting\n");
++		return;
++	}
++	gen->alt_dac_nid = gen->multiout.dac_nids[1];
++	gen->multiout.num_dacs = 1;
++	gen->multiout.max_channels = 2;
++	codec_info(codec, "split_speakers: DAC 0x%02x on the Alt Analog PCM\n",
++		   gen->alt_dac_nid);
++}
++
+ static const struct hda_fixup cs4208_fixups[] = {
+ 	[CS4208_MBA6] = {
+ 		.type = HDA_FIXUP_PINS,
+@@ -676,7 +716,7 @@
+ 	},
+ 	[CS4208_MBP11] = {
+ 		.type = HDA_FIXUP_FUNC,
+-		.v.func = cs4208_fixup_spdif_switch,
++		.v.func = cs4208_fixup_mbp11,
+ 		.chained = true,
+ 		.chain_id = CS4208_GPIO0,
+ 	},

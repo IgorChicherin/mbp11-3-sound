@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# MacBookPro11,3 speaker crossover on top of kernel patch 0018 (split_speakers=1). No sudo anywhere.
+# One virtual output, "MacBook Speakers", takes stereo and sends highs to the tweeters (hw:PCH,0) and lows to
+# the woofers (hw:PCH,2). On headphones the plain ALSA output is used instead (full range).
+#   mbp-speakers check              exit 0 if this kernel has the split on (used by the systemd unit)
+#   mbp-speakers run                the service: woofer node + filter + headphone switching
+#   mbp-speakers tune KEY=VALUE...  change tuning values (within safe ranges), save them, restart the service
+#   mbp-speakers show               print the tuning values and the state
+# Tuning values live in ~/.config/mbp-speakers/params (created on first run).
+set -euo pipefail
+export LC_ALL=C
+
+raw=alsa_output.pci-0000_00_1b.0.analog-stereo   # PipeWire's own sink on hw:PCH,0: tweeters + headphone jack
+card=PCH
+params=${XDG_CONFIG_HOME:-$HOME/.config}/mbp-speakers/params
+conf=${XDG_RUNTIME_DIR:?}/mbp-speakers.conf
+split=/sys/module/snd_hda_codec_cs420x/parameters/split_speakers
+
+# Defaults: the values tuned by ear on a MacBookPro11,3 with the limiter. Frequencies in Hz, gains in dB.
+XOVER=1000          # tweeter/woofer crossover (4th-order Linkwitz-Riley)
+SUB_HP=70           # woofer high-pass: below this the drivers only waste excursion
+BASS_FREQ=200       # low-shelf corner
+BASS_GAIN=2         # low-shelf boost on the woofers
+WOOFER_GAIN=0       # woofer level trim
+TWEETER_GAIN=0      # tweeter level trim
+PREAMP=0            # attenuation before the limiter. Without swh-plugins set it to -BASS_GAIN, or peaks clip
+LOUD=6              # gain into the limiter: louder at the cost of dynamics. Needs swh-plugins; ignored without it
+LIMIT=-1            # limiter ceiling, dBFS: no sample leaves louder than this
+keys="XOVER SUB_HP BASS_FREQ BASS_GAIN WOOFER_GAIN TWEETER_GAIN PREAMP LOUD LIMIT"
+# Allowed range per key (min max). The bounds keep bass out of the tweeters, sub-bass out of the woofers and
+# the average power bounded; the amplifier's peak output is fixed by the hardware either way.
+declare -A range=([XOVER]="700 2500" [SUB_HP]="50 150" [BASS_FREQ]="100 400" [BASS_GAIN]="-6 9"
+  [WOOFER_GAIN]="-12 0" [TWEETER_GAIN]="-12 0" [PREAMP]="-12 0" [LOUD]="0 9" [LIMIT]="-6 -0.5")
+# Fast lookahead limiter from swh-plugins (LADSPA), one stereo instance per speaker pair.
+limiter_so=${MBP_LIMITER_SO:-/usr/lib/ladspa/fast_lookahead_limiter_1913.so}
+
+load_params() { [[ -r $params ]] && . "$params"; return 0; }
+save_params() {
+  mkdir -p "${params%/*}"
+  for k in $keys; do echo "$k=${!k}"; done >"$params"
+}
+check() { [[ -r $split && $(<"$split") == Y ]] && aplay -l 2>/dev/null | grep -q "card [0-9]*: $card .*device 2:"; }
+lin() { awk -v d="$1" 'BEGIN { printf "%.4f", 10 ^ (d / 20) }'; }
+node_id() { pw-cli ls Node 2>/dev/null | awk -v n="\"$1\"" '$1=="id" {id=$2+0} $1=="node.name" && $3==n {print id; exit}'; }
+have_sink() { pactl list short sinks 2>/dev/null | awk -v n="$1" '$2==n {f=1} END {exit !f}'; }
+
+gen_conf() {
+  local tw wf ch nodes= links= outs='"twgL:Out" "twgR:Out" "wfgL:Out" "wfgR:Out"'
+  tw=$(lin "$(awk -v a="$PREAMP" -v b="$TWEETER_GAIN" 'BEGIN {print a + b}')")
+  wf=$(lin "$(awk -v a="$PREAMP" -v b="$WOOFER_GAIN" 'BEGIN {print a + b}')")
+  for ch in L R; do
+    nodes+="
+          { type = builtin name = in$ch    label = copy }
+          { type = builtin name = twh1$ch  label = bq_highpass control = { \"Freq\" = $XOVER \"Q\" = 0.7071 } }
+          { type = builtin name = twh2$ch  label = bq_highpass control = { \"Freq\" = $XOVER \"Q\" = 0.7071 } }
+          { type = builtin name = twg$ch   label = mixer       control = { \"Gain 1\" = $tw } }
+          { type = builtin name = bass$ch  label = bq_lowshelf control = { \"Freq\" = $BASS_FREQ \"Q\" = 0.7071 \"Gain\" = $BASS_GAIN } }
+          { type = builtin name = sub$ch   label = bq_highpass control = { \"Freq\" = $SUB_HP \"Q\" = 0.7071 } }
+          { type = builtin name = wfl1$ch  label = bq_lowpass  control = { \"Freq\" = $XOVER \"Q\" = 0.7071 } }
+          { type = builtin name = wfl2$ch  label = bq_lowpass  control = { \"Freq\" = $XOVER \"Q\" = 0.7071 } }
+          { type = builtin name = wfg$ch   label = mixer       control = { \"Gain 1\" = $wf } }"
+    links+="
+          { output = \"in$ch:Out\"   input = \"twh1$ch:In\" }
+          { output = \"twh1$ch:Out\" input = \"twh2$ch:In\" }
+          { output = \"twh2$ch:Out\" input = \"twg$ch:In 1\" }
+          { output = \"in$ch:Out\"   input = \"bass$ch:In\" }
+          { output = \"bass$ch:Out\" input = \"sub$ch:In\" }
+          { output = \"sub$ch:Out\"  input = \"wfl1$ch:In\" }
+          { output = \"wfl1$ch:Out\" input = \"wfl2$ch:In\" }
+          { output = \"wfl2$ch:Out\" input = \"wfg$ch:In 1\" }"
+  done
+  if [[ -r $limiter_so ]]; then
+    for ch in T W; do
+      nodes+="
+          { type = ladspa name = lim$ch plugin = \"$limiter_so\" label = fastLookaheadLimiter
+            control = { \"Input gain (dB)\" = $LOUD \"Limit (dB)\" = $LIMIT \"Release time (s)\" = 0.25 } }"
+    done
+    links+="
+          { output = \"twgL:Out\" input = \"limT:Input 1\" }
+          { output = \"twgR:Out\" input = \"limT:Input 2\" }
+          { output = \"wfgL:Out\" input = \"limW:Input 1\" }
+          { output = \"wfgR:Out\" input = \"limW:Input 2\" }"
+    outs='"limT:Output 1" "limT:Output 2" "limW:Output 1" "limW:Output 2"'
+  fi
+  cat >"$conf" <<CONF
+# Generated by mbp-speakers from $params. Do not edit: use "mbp-speakers tune".
+context.properties = { log.level = 2 }
+context.spa-libs = {
+  audio.convert.* = audioconvert/libspa-audioconvert
+  support.*       = support/libspa-support
+}
+context.modules = [
+  { name = libpipewire-module-rt args = { } flags = [ ifexists nofail ] }
+  { name = libpipewire-module-protocol-native }
+  { name = libpipewire-module-client-node }
+  { name = libpipewire-module-adapter }
+  # 4-channel sink over the two PCMs: FL FR -> tweeters, RL RR -> woofers.
+  { name = libpipewire-module-combine-stream
+    args = {
+      combine.mode = sink
+      node.name = "mbp_quad"
+      node.description = "MacBook speakers 4ch (internal)"
+      combine.latency-compensate = false
+      # "Internal": linkable by name, but not listed as an output device in desktop volume controls.
+      combine.props = { audio.position = [ FL FR RL RR ] media.class = "Audio/Sink/Internal" }
+      stream.props = { stream.dont-remix = true }
+      stream.rules = [
+        { matches = [ { media.class = "Audio/Sink" node.name = "$raw" } ]
+          actions = { create-stream = { combine.audio.position = [ FL FR ] audio.position = [ FL FR ] } } }
+        { matches = [ { node.name = "mbp_woofers" } ]
+          actions = { create-stream = { combine.audio.position = [ RL RR ] audio.position = [ FL FR ] } } }
+      ]
+    }
+  }
+  # Stereo in, crossover, 4 channels out.
+  { name = libpipewire-module-filter-chain
+    args = {
+      node.description = "MacBook Speakers"
+      media.name = "MacBook Speakers"
+      filter.graph = {
+        nodes = [$nodes
+        ]
+        links = [$links
+        ]
+        inputs  = [ "inL:In" "inR:In" ]
+        outputs = [ $outs ]
+      }
+      capture.props = {
+        node.name = "mbp_speakers"
+        media.class = "Audio/Sink"
+        audio.position = [ FL FR ]
+        priority.session = 2000
+      }
+      playback.props = {
+        node.name = "mbp_speakers.out"
+        audio.position = [ FL FR RL RR ]
+        target.object = "mbp_quad"
+        stream.dont-remix = true
+        node.passive = true
+      }
+    }
+  }
+]
+CONF
+}
+
+# Speakers -> "MacBook Speakers"; headphones -> the plain output. Leaves any other default (Bluetooth, HDMI) alone.
+sync_default() {
+  local port cur
+  port=$(pactl list sinks | awk -v s="$raw" '$1=="Name:" {p=($2==s)} p && /Active Port:/ {print $3; exit}')
+  cur=$(pactl get-default-sink 2>/dev/null) || return 0
+  if [[ $port == *headphones* ]]; then
+    [[ $cur == mbp_speakers ]] && pactl set-default-sink "$raw"
+  elif [[ $cur == "$raw" ]] && have_sink mbp_speakers; then
+    pactl set-default-sink mbp_speakers
+  fi
+  return 0
+}
+
+run() {
+  local id pw clock i
+  check || { echo "split_speakers is off or hw:$card,2 is missing; nothing to do" >&2; exit 1; }
+  load_params; save_params; gen_conf
+  for i in {1..30}; do pactl info >/dev/null 2>&1 && have_sink "$raw" && break; sleep 0.5; done
+  id=$(node_id mbp_woofers); [[ -n $id ]] && pw-cli destroy "$id" >/dev/null || true
+  # Same clock name as the tweeter PCM: one card, one clock, so PipeWire must not resample between them.
+  clock=$(pw-cli e "$(node_id "$raw")" Props 2>/dev/null | tr -d '\n' | sed -n 's/.*String "clock.name" *String "\([^"]*\)".*/\1/p')
+  pw-cli create-node adapter "{ factory.name=api.alsa.pcm.sink node.name=mbp_woofers
+    node.description=\"MacBook woofers (internal)\" media.class=Audio/Sink/Internal api.alsa.path=\"hw:$card,2\"
+    audio.channels=2 audio.position=\"FL,FR\" priority.driver=40
+    ${clock:+clock.name=\"$clock\"} object.linger=true }" >/dev/null
+  pipewire -c "$conf" & pw=$!
+  cleanup() {
+    trap - EXIT INT TERM
+    [[ $(pactl get-default-sink 2>/dev/null) == mbp_speakers ]] && pactl set-default-sink "$raw" || true
+    kill "$pw" 2>/dev/null || true
+    id=$(node_id mbp_woofers); [[ -n $id ]] && pw-cli destroy "$id" >/dev/null || true
+    rm -f "$conf"
+  }
+  trap cleanup EXIT; trap 'exit 0' INT TERM
+  for i in {1..20}; do have_sink mbp_speakers && break; sleep 0.25; done
+  have_sink mbp_speakers || { echo "the MacBook Speakers sink did not appear" >&2; exit 2; }
+  sync_default
+  # Any sink, card or server event may be a jack plug or a default change; the filter dying ends the service.
+  while kill -0 "$pw" 2>/dev/null; do
+    if read -r -t 5 _; then sync_default
+    elif (( $? <= 128 )); then break    # end of the event stream, not a timeout
+    fi
+  done < <(pactl subscribe | grep --line-buffered -E "on (sink|card|server) ")
+  exit 3
+}
+
+case ${1:-} in
+  check) check ;;
+  run) run ;;
+  show)
+    load_params
+    for k in $keys; do echo "$k=${!k}"; done
+    [[ -r $limiter_so ]] && echo "limiter: on ($limiter_so)" || echo "limiter: off (install swh-plugins); LOUD and LIMIT are ignored"
+    echo "split: $(cat "$split" 2>/dev/null || echo 'no patch 0018')   service: $(systemctl --user is-active mbp-speakers.service 2>/dev/null)   default: $(pactl get-default-sink 2>/dev/null)"
+    ;;
+  tune)
+    load_params; shift
+    for kv in "$@"; do
+      k=${kv%%=*}; v=${kv#*=}
+      [[ " $keys " == *" $k "* && $v =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || { echo "ERROR: bad setting '$kv'. Keys: $keys" >&2; exit 1; }
+      read -r lo hi <<<"${range[$k]}"
+      awk -v v="$v" -v lo="$lo" -v hi="$hi" 'BEGIN {exit !(v >= lo && v <= hi)}' ||
+        { echo "ERROR: $k must be between $lo and $hi" >&2; exit 1; }
+      printf -v "$k" %s "$v"
+    done
+    save_params
+    systemctl --user restart mbp-speakers.service
+    "$0" show
+    ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac
